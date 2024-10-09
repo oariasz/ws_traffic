@@ -59,6 +59,45 @@ Before using the WhatsApp Packet Capture Analyzer, ensure that your system meets
 
 ### 1. Clone the Repository
 
-```bash
+
 git clone https://github.com/yourusername/whatsapp-packet-capture-analyzer.git
 cd whatsapp-packet-capture-analyzer
+
+
+## Configuration
+The analyzer is highly configurable through a dictionary within the script. Below are the key configuration parameters and how to set them:
+
+1. Configuration Parameters
+Located within the main() function of ws_traffic.py:
+
+python
+Copiar código
+config = {
+    'WHATSAPP_DOMAINS': [
+        "whatsapp.com",
+        "api.whatsapp.com",
+        "web.whatsapp.com",
+        "wa.me",
+        "whatsapp.net",
+        "chat.whatsapp.com",
+        # Add more domains if necessary
+    ],
+    'IP_UPDATE_INTERVAL': 3600,  # in seconds (1 hour)
+    'TIME_WINDOW_SECONDS': 1,
+    'UPDATE_INTERVAL': 1,  # in seconds
+    'PACKET_HISTORY_LENGTH': 60,  # Last 60 seconds
+    'EVENT_THRESHOLD': 3,
+    'DEFAULT_INTERFACE': "en2",
+    'LOG_FILE': "whatsapp_packet_log.csv",
+    'ENABLE_PLOTTING': False  # Set to True to enable plotting
+}
+2. Key Configuration Options
+WHATSAPP_DOMAINS: List of WhatsApp-related domains to resolve and monitor.
+IP_UPDATE_INTERVAL: Time interval (in seconds) to re-resolve WhatsApp IP addresses. Defaults to 1 hour.
+TIME_WINDOW_SECONDS: Duration (in seconds) for each packet capture window.
+UPDATE_INTERVAL: Frequency (in seconds) at which packet capturing occurs.
+PACKET_HISTORY_LENGTH: Number of recent packet counts to store for plotting purposes.
+EVENT_THRESHOLD: Minimum number of packets to classify an event as SENT or RCVD.
+DEFAULT_INTERFACE: Network interface to monitor (e.g., en2, eth0). Change this based on your system.
+LOG_FILE: Name of the CSV log file where data will be stored.
+ENABLE_PLOTTING: Boolean flag to enable (True) or disable (False) real-time plotting.
