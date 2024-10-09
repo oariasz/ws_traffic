@@ -1,0 +1,423 @@
+#!/usr/bin/env python3
+"""
+whatsapp_packet_capture_enhanced.py
+
+A Python script to capture and display detailed WhatsApp packet information every second.
+Includes features such as dynamic IP resolution, IPv4 and IPv6 support, packet direction
+determination, event classification, clean output formatting, and logging for offline analysis.
+
+Author: [Your Name]
+Date: 2024-10-08
+"""
+
+import datetime
+from scapy.all import sniff, IP
+from scapy.layers.inet6 import IPv6
+from collections import deque
+import threading
+import socket
+import sys
+import time
+import logging
+from tabulate import tabulate
+
+# ============================
+# Configuration Parameters
+# ============================
+
+# WhatsApp domains to resolve to IP addresses
+WHATSAPP_DOMAINS = [
+    "whatsapp.com",
+    "api.whatsapp.com",
+    "web.whatsapp.com",
+    "wa.me",
+    "whatsapp.net",
+    "chat.whatsapp.com",
+    # Add more domains if necessary
+]
+
+# Update interval for IP resolution (in seconds)
+IP_UPDATE_INTERVAL = 3600  # 1 hour
+
+# Packet capturing settings
+TIME_WINDOW_SECONDS = 1
+UPDATE_INTERVAL = 1  # in seconds
+
+# Packet history length for potential future plotting
+PACKET_HISTORY_LENGTH = 60  # Last 60 seconds
+
+# Event detection threshold
+EVENT_THRESHOLD = 3  # Minimum number of packets to consider an event
+
+# Network interface to sniff on (default: "en2")
+DEFAULT_INTERFACE = "en2"
+
+# Log file path
+LOG_FILE = "whatsapp_packet_log.log"
+
+# Enable or disable real-time plotting
+ENABLE_PLOTTING = False  # Set to True to enable plotting
+
+# ============================
+# Logging Configuration
+# ============================
+
+# Configure logging for offline analysis
+logging.basicConfig(
+    filename=LOG_FILE,
+    level=logging.INFO,
+    format='%(asctime)s | Source IP(s): %(source_ips)s | Destination IP(s): %(destination_ips)s | '
+           'Packets Sent: %(sent_count)d | Packets Received: %(received_count)d | '
+           'Bytes Sent: %(sent_bytes)d | Bytes Received: %(received_bytes)d | '
+           'Total Bytes: %(total_bytes)d | Event: %(event)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
+
+# ============================
+# Global Variables
+# ============================
+
+# Deques to store packet counts and timestamps
+# Keeping last 60 intervals (60 seconds total) for potential future plotting
+packet_counts = deque([0] * PACKET_HISTORY_LENGTH, maxlen=PACKET_HISTORY_LENGTH)
+timestamps = deque([datetime.datetime.now().strftime("%H:%M:%S")] * PACKET_HISTORY_LENGTH, maxlen=PACKET_HISTORY_LENGTH)
+
+# ============================
+# Utility Functions
+# ============================
+
+def get_whatsapp_ips(domains):
+    """
+    Resolve WhatsApp domains to their current IP addresses.
+
+    Parameters:
+        domains (list): List of WhatsApp-related domain names.
+
+    Returns:
+        list: List of resolved IP addresses.
+    """
+    ip_set = set()
+    for domain in domains:
+        try:
+            resolved_ips = socket.gethostbyname_ex(domain)[2]
+            ip_set.update(resolved_ips)
+            print(f"Resolved {domain}: {', '.join(resolved_ips)}")
+        except socket.gaierror:
+            print(f"Failed to resolve domain: {domain}")
+    return list(ip_set)
+
+def get_local_ips():
+    """
+    Retrieve all local IP addresses assigned to the device.
+
+    Returns:
+        list: List of local IP addresses.
+    """
+    local_ips = set()
+    hostname = socket.gethostname()
+    try:
+        local_ip = socket.gethostbyname(hostname)
+        local_ips.add(local_ip)
+    except socket.gaierror:
+        pass
+
+    # Retrieve all IP addresses associated with the device
+    for info in socket.getaddrinfo(hostname, None):
+        ip = info[4][0]
+        local_ips.add(ip)
+    return list(local_ips)
+
+def format_ips(ip_set, max_ips=2, max_length=20):
+    """
+    Format IP addresses by limiting the number of IPs displayed and truncating if necessary.
+
+    Parameters:
+        ip_set (set): Set of IP addresses.
+        max_ips (int): Maximum number of IPs to display.
+        max_length (int): Maximum length of the formatted IP string.
+
+    Returns:
+        str: Formatted IP addresses string.
+    """
+    ips = list(ip_set)
+    if len(ips) > max_ips:
+        formatted = ", ".join(ips[:max_ips]) + ",..."
+    else:
+        formatted = ", ".join(ips)
+    if len(formatted) > max_length:
+        return formatted[:max_length-3] + "..."
+    return formatted
+
+def get_packet_direction(packet, local_ips):
+    """
+    Determine the direction of the packet relative to the local device.
+
+    Parameters:
+        packet (scapy.packet.Packet): The captured network packet.
+        local_ips (list): List of local IP addresses.
+
+    Returns:
+        str: "Sent", "Received", or "Unknown"
+    """
+    if IP in packet:
+        src_ip = packet[IP].src
+        dst_ip = packet[IP].dst
+        if src_ip in local_ips:
+            return "Sent"
+        elif dst_ip in local_ips:
+            return "Received"
+    if IPv6 in packet:
+        src_ip = packet[IPv6].src
+        dst_ip = packet[IPv6].dst
+        if src_ip in local_ips:
+            return "Sent"
+        elif dst_ip in local_ips:
+            return "Received"
+    return "Unknown"
+
+def detect_message_event(sent_count, received_count, threshold=EVENT_THRESHOLD):
+    """
+    Detects send or receive events based on packet counts.
+
+    Parameters:
+        sent_count (int): Number of sent packets.
+        received_count (int): Number of received packets.
+        threshold (int): Minimum number of packets to consider an event.
+
+    Returns:
+        str: "SENT", "RCVD", or "OTHER"
+    """
+    if sent_count >= threshold and sent_count > received_count:
+        return "SENT"
+    elif received_count >= threshold and received_count > sent_count:
+        return "RCVD"
+    else:
+        return "OTHER"
+
+# ============================
+# Packet Capturing Function
+# ============================
+
+def capture_packets(interface="en2"):
+    """
+    Capture WhatsApp packets, determine direction, and update counts.
+
+    Parameters:
+        interface (str): Network interface to sniff on (e.g., "en2").
+    """
+    print(f"Starting packet capture on interface: {interface}")
+    while True:
+        try:
+            # Capture packets for the defined update interval
+            packets = sniff(
+                iface=interface,
+                timeout=UPDATE_INTERVAL,
+                filter="ip or ip6",
+                prn=lambda pkt: pkt if is_whatsapp_packet(pkt) else None
+            )
+            # Filter out None packets
+            whatsapp_packets = [pkt for pkt in packets if pkt]
+            whatsapp_packet_count = len(whatsapp_packets)
+            
+            # Initialize counters and IP sets
+            sent_count = 0
+            received_count = 0
+            sent_bytes = 0
+            received_bytes = 0
+            source_ips = set()
+            destination_ips = set()
+            
+            for pkt in whatsapp_packets:
+                direction = get_packet_direction(pkt, LOCAL_IPS)
+                pkt_size = len(pkt)
+                if direction == "Sent":
+                    sent_count += 1
+                    sent_bytes += pkt_size
+                    if IP in pkt:
+                        source_ips.add(pkt[IP].src)
+                        destination_ips.add(pkt[IP].dst)
+                    elif IPv6 in pkt:
+                        source_ips.add(pkt[IPv6].src)
+                        destination_ips.add(pkt[IPv6].dst)
+                elif direction == "Received":
+                    received_count += 1
+                    received_bytes += pkt_size
+                    if IP in pkt:
+                        source_ips.add(pkt[IP].src)
+                        destination_ips.add(pkt[IP].dst)
+                    elif IPv6 in pkt:
+                        source_ips.add(pkt[IPv6].src)
+                        destination_ips.add(pkt[IPv6].dst)
+            
+            # Calculate Total Bytes
+            total_bytes = sent_bytes + received_bytes
+            
+            # Detect event classification
+            event = detect_message_event(sent_count, received_count)
+            
+            # Get current time
+            current_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            
+            # Prepare source and destination IP strings
+            source_ips_str = format_ips(source_ips)
+            destination_ips_str = format_ips(destination_ips)
+            
+            # Prepare row data
+            row = [
+                current_time,
+                source_ips_str,
+                destination_ips_str,
+                sent_count,
+                received_count,
+                event
+            ]
+            
+            # Print the row
+            print(tabulate([row], tablefmt="plain"))
+            
+            # Log the data
+            logging.info('', extra={
+                'source_ips': source_ips_str,
+                'destination_ips': destination_ips_str,
+                'sent_count': sent_count,
+                'received_count': received_count,
+                'sent_bytes': sent_bytes,
+                'received_bytes': received_bytes,
+                'total_bytes': total_bytes,
+                'event': event
+            })
+            
+            # Update deques (optional, retained for future plotting)
+            packet_counts.append(whatsapp_packet_count)
+            timestamps.append(current_time)
+        except Exception as e:
+            print(f"Error capturing packets: {e}")
+
+# ============================
+# WhatsApp Packet Identification
+# ============================
+
+def is_whatsapp_packet(packet):
+    """
+    Check if a packet is from or to a WhatsApp IP address.
+
+    Parameters:
+        packet (scapy.packet.Packet): The captured network packet.
+
+    Returns:
+        bool: True if packet is WhatsApp-related, False otherwise.
+    """
+    if IP in packet:
+        src_ip = packet[IP].src
+        dst_ip = packet[IP].dst
+        for ip in WHATSAPP_IPS:
+            if src_ip == ip or dst_ip == ip:
+                return True
+    if IPv6 in packet:
+        src_ip = packet[IPv6].src
+        dst_ip = packet[IPv6].dst
+        for ip in WHATSAPP_IPS:
+            if src_ip == ip or dst_ip == ip:
+                return True
+    return False
+
+# ============================
+# Dynamic IP Resolution Thread
+# ============================
+
+def update_whatsapp_ips(interval=IP_UPDATE_INTERVAL):
+    """
+    Periodically update WhatsApp IPs by resolving domains.
+
+    Parameters:
+        interval (int): Time interval between updates in seconds.
+    """
+    global WHATSAPP_IPS
+    while True:
+        time.sleep(interval)
+        WHATSAPP_IPS = get_whatsapp_ips(WHATSAPP_DOMAINS)
+        print(f"\n[INFO] Updated WhatsApp IPs at {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}: {WHATSAPP_IPS}\n")
+
+# ============================
+# Plotting Functions (Optional)
+# ============================
+
+def start_plotting():
+    """
+    Start the matplotlib plotting in a separate thread if ENABLE_PLOTTING is True.
+    """
+    import matplotlib.pyplot as plt
+    from matplotlib.animation import FuncAnimation
+
+    def update_graph(frame):
+        """Update the dynamic line chart with the latest WhatsApp traffic data."""
+        plt.cla()  # Clear the previous plot
+        plt.plot(timestamps, packet_counts, marker='o', linestyle='-', color='blue')
+        plt.title(f"WhatsApp Traffic Over Time (Last {PACKET_HISTORY_LENGTH} Seconds)")
+        plt.xlabel("Time")
+        plt.ylabel("Packet Count")
+        plt.xticks(rotation=45, ha='right')
+        plt.tight_layout()
+        plt.grid(True)
+
+    plt.figure(figsize=(10, 6))
+    ani = FuncAnimation(plt.gcf(), update_graph, interval=UPDATE_INTERVAL * 1000)
+    plt.show()
+
+# ============================
+# Main Function
+# ============================
+
+def main(interface=DEFAULT_INTERFACE):
+    """
+    Main function to start capturing packets.
+
+    Parameters:
+        interface (str): Network interface to sniff on (e.g., "en2").
+    """
+    # Start dynamic IP updating thread
+    ip_update_thread = threading.Thread(target=update_whatsapp_ips, daemon=True)
+    ip_update_thread.start()
+    
+    # Print table headers
+    headers = ["Time", "SRC IP(s)", "DST IP(s)", "S", "R", "Event"]
+    print(tabulate([headers], headers="firstrow", tablefmt="plain"))
+    
+    # Start capturing packets in a separate thread
+    capture_thread = threading.Thread(target=capture_packets, args=(interface,), daemon=True)
+    capture_thread.start()
+
+    # Start plotting if enabled
+    if ENABLE_PLOTTING:
+        start_plotting()
+
+    # Keep the main thread alive to allow packet capturing
+    try:
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        print("\nPacket capturing stopped by user.")
+        sys.exit(0)
+
+# ============================
+# Script Entry Point
+# ============================
+
+if __name__ == "__main__":
+    # Dynamically resolve WhatsApp IPs at startup
+    WHATSAPP_IPS = get_whatsapp_ips(WHATSAPP_DOMAINS)
+    
+    # Retrieve local IPs
+    LOCAL_IPS = get_local_ips()
+    print(f"Local IP Addresses: {LOCAL_IPS}")
+    
+    # Determine network interface to sniff on
+    if len(sys.argv) > 1:
+        iface = sys.argv[1]
+    else:
+        iface = DEFAULT_INTERFACE  # Default interface, change if necessary
+    
+    print(f"Using network interface: {iface}")
+    
+    # Start the main function
+    main(interface=iface)
